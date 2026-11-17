@@ -2539,12 +2539,12 @@ QmlMainWindow::QmlMainWindow(const StreamSessionConnectInfo &connect_info)
     , settings(connect_info.settings)
 {
     direct_stream = true;
+    direct_start_fullscreen = connect_info.fullscreen || connect_info.zoom || connect_info.stretch;
+    direct_start_borderless = connect_info.borderless_window;
     emit directStreamChanged();
     init(connect_info.settings);
     backend->createSession(connect_info);
 
-    if (connect_info.fullscreen || connect_info.zoom || connect_info.stretch)
-        fullscreenTime();
     if (connect_info.zoom)
         setVideoMode(VideoMode::Zoom);
     else if (connect_info.stretch)
@@ -2910,6 +2910,23 @@ void QmlMainWindow::show()
         QMetaObject::invokeMethod(quick_item, "showRendererFallbackDialog",
                                   Q_ARG(QVariant, QVariant::fromValue(reason)));
     }
+    if (direct_start_fullscreen) {
+        setWindowAdjustable(false);
+        setStreamWindowAdjustable(false);
+        setMinimumSize(QSize(0, 0));
+        showFullScreen();
+        return;
+    }
+    if (direct_start_borderless) {
+        const QRect work = (screen() ? screen() : QGuiApplication::primaryScreen())->availableGeometry();
+        const QSize size = QSize(1280, 800).boundedTo(work.size());
+        QRect bounds{QPoint{}, size};
+        bounds.moveCenter(work.center());
+        setFlag(Qt::FramelessWindowHint);
+        setGeometry(bounds);
+        showNormal();
+        return;
+    }
     auto screen_size = QGuiApplication::primaryScreen()->availableSize();
     resize(screen_size);
 
@@ -3003,7 +3020,8 @@ bool QmlMainWindow::configuredFrameMixerEnabledForScheduling() const
     return frame_mixer_config(settings) != nullptr;
 }
 
-void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us)
+void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost,
+                                 qint64 decoder_delivery_us, qint64 decoder_ready_us)
 {
     const qint64 present_entry_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     if (decoder_delivery_us > 0 && present_entry_us >= decoder_delivery_us) {
@@ -3028,6 +3046,7 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
                 dropped_frames_current.fetchAndAddRelaxed(1);
             }
             direct_pending_frame = frame.frame;
+            direct_pending_decoder_ready_us = decoder_ready_us;
         }
         if (!startup_warmup_frame_active)
             startup_first_real_frame_queued_pending_visibility.storeRelease(1);
@@ -4832,6 +4851,16 @@ void QmlMainWindow::doneOpenGLContextCurrent()
     }, Qt::BlockingQueuedConnection);
 }
 
+#ifdef Q_OS_WIN
+void QmlMainWindow::refreshWindowsDisplayHdr()
+{
+    const auto display = queryWindowsDisplayHdr(reinterpret_cast<HWND>(winId()));
+    const auto previous = windows_hdr_display.exchange(display, std::memory_order_relaxed);
+    if (previous.peak_nits != display.peak_nits || previous.black_nits != display.black_nits)
+        qCInfo(chiakiGui) << "Windows HDR display range (nits):" << display.black_nits << display.peak_nits;
+}
+#endif
+
 void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
 {
     bypass_frame_queue = settings->GetDirectFrameMapping();
@@ -5352,6 +5381,13 @@ renderer_backend_ready:
         break;
     }
     setZoomFactor(settings->GetZoomFactor());
+#ifdef Q_OS_WIN
+    if (render_backend == RenderBackend::Vulkan) {
+        connect(this, &QWindow::screenChanged, this, &QmlMainWindow::refreshWindowsDisplayHdr);
+        connect(this, &QWindow::activeChanged, this, &QmlMainWindow::refreshWindowsDisplayHdr);
+        QTimer::singleShot(0, this, &QmlMainWindow::refreshWindowsDisplayHdr);
+    }
+#endif
 }
 
 void QmlMainWindow::drainRenderThread()
@@ -6782,12 +6818,16 @@ void QmlMainWindow::render()
     const struct pl_frame *direct_frames[] = { &direct_render_frame };
     // pl_frame_mix timestamps are float before libplacebo API 387 and double from it
     const std::remove_cv_t<std::remove_pointer_t<decltype(pl_frame_mix::timestamps)>> direct_timestamps[] = { 0 };
+    qint64 direct_decoder_ready_us = 0;
     if (bypass_frame_queue) {
         AVFrame *incoming = nullptr;
         bool reset_direct_frame = false;
         {
             QMutexLocker locker(&direct_frame_mutex);
             std::swap(incoming, direct_pending_frame);
+            direct_decoder_ready_us = std::exchange(direct_pending_decoder_ready_us, 0);
+            if (!incoming)
+                direct_decoder_ready_us = 0;
             reset_direct_frame = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
         }
         if (reset_direct_frame) {
@@ -6804,6 +6844,7 @@ void QmlMainWindow::render()
                 qCWarning(chiakiGui) << "Failed to map direct video frame";
                 pl_unmap_avframe(placeboGpu(), &direct_frame);
                 direct_frame = {};
+                direct_decoder_ready_us = 0;
                 if (backend && backend->zeroCopy())
                     backend->disableZeroCopy();
             }
@@ -7067,7 +7108,7 @@ void QmlMainWindow::render()
     if (render_entry_us_local > 0 && render_to_start_frame_us >= render_entry_us_local)
         logLatencyStats("render_to_start_frame", render_to_start_frame_us - render_entry_us_local);
     // Submit immediately and let the swapchain / render path enforce pacing.
-    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present) -> bool {
+    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s, direct_decoder_ready_us](bool present) -> bool {
         const qint64 submit_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         const int queue_depth_now = snapshotQueueDepth();
         if (detailedVerboseTelemetryEnabled()) {
@@ -7117,8 +7158,14 @@ void QmlMainWindow::render()
             vulkan_deferred_swap_enabled &&
             deferred_swap_thread &&
             deferred_present_in_flight.loadAcquire() == 0;
+        // In immediate mode, a fresh directly mapped frame can reach the
+        // swapchain without waiting on the software frame pacer.
+        static const bool immediate_direct_present =
+            qEnvironmentVariableIntValue("CHIAKI_DIRECT_PRESENT_IMMEDIATE") == 1;
+        const bool skip_software_pacing = immediate_direct_present && direct_decoder_ready_us > 0 &&
+            render_backend == RenderBackend::Vulkan && !present_vsync_enabled;
         if (!use_deferred_swap) {
-            if (present) {
+            if (present && !skip_software_pacing) {
                 const double pace_multiplier = pending_overflow_waiting
                     ? 0.80
                     : (present_backpressure_active.loadAcquire() != 0 ? 0.90 : 1.0);
@@ -7153,6 +7200,10 @@ void QmlMainWindow::render()
                 else {
                     confirmVulkanStartup();
                     submit_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+                    if (present && direct_decoder_ready_us > 0 && submit_us >= direct_decoder_ready_us) {
+                        CHIAKI_NOISY_DEBUG().nospace()
+                            << "[latency] direct_decoder_ready_to_submit_us=" << (submit_us - direct_decoder_ready_us);
+                    }
             logLatencyStats("pl_swapchain_submit_frame", submit_us - submit_begin_us);
             CHIAKI_NOISY_DEBUG().nospace()
                 << "[latency] pl_swapchain_submit_frame_us=" << (submit_us - submit_begin_us)
@@ -7379,6 +7430,29 @@ void QmlMainWindow::render()
     };
     target_frame.overlays = &overlay;
     target_frame.num_overlays = 1;
+#ifdef Q_OS_WIN
+    // Set the destination luminance independently of the source HDR metadata.
+    // The swapchain still owns its transfer function and signal format.
+    if (apply_display_target && render_backend == RenderBackend::Vulkan && hint_frame &&
+        !target_prim && !target_trc && !target_peak && !target_contrast &&
+        pl_color_space_is_hdr(&hint_frame->color) && pl_color_space_is_hdr(&target_frame.color)) {
+        const auto display = windows_hdr_display.load(std::memory_order_relaxed);
+        if (display.peak_nits > 0.0f) {
+            target_frame.color.hdr.max_luma = display.peak_nits;
+            target_frame.color.hdr.min_luma = display.black_nits;
+            if (display.peak_nits != applied_windows_hdr_display.peak_nits ||
+                display.black_nits != applied_windows_hdr_display.black_nits) {
+                qCInfo(chiakiGui) << "HDR rendering uses Windows display range (nits):"
+                                 << display.black_nits << display.peak_nits
+                                 << "source transfer:" << hint_frame->color.transfer
+                                 << "swapchain transfer:" << target_frame.color.transfer;
+            }
+        }
+        applied_windows_hdr_display = display;
+    } else {
+        applied_windows_hdr_display = {};
+    }
+#endif
     if(target_prim)
     {
         target_frame.color.primaries = static_cast<pl_color_primaries>(target_prim);
@@ -7782,14 +7856,14 @@ bool QmlMainWindow::event(QEvent *event)
                 QMetaObject::invokeMethod(quick_render, std::bind(&QmlMainWindow::destroySwapchain, this), Qt::BlockingQueuedConnection);
         break;
     case QEvent::Move:
-        if(!session && isWindowAdjustable())
+        if(!direct_stream && !session && isWindowAdjustable())
             settings->SetGeometry(geometry());
         else if(session && settings->GetWindowType() == WindowType::AdjustableResolution && isStreamWindowAdjustable())
             settings->SetStreamGeometry(geometry());
         updateStatsOverlayGeometry();
         break;
     case QEvent::Resize:
-        if(!session && isWindowAdjustable())
+        if(!direct_stream && !session && isWindowAdjustable())
             settings->SetGeometry(geometry());
         else if(session && settings->GetWindowType() == WindowType::AdjustableResolution && isStreamWindowAdjustable())
             settings->SetStreamGeometry(geometry());

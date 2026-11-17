@@ -3,7 +3,10 @@
 #include <chiaki/time.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixdesc.h>
+#include <inttypes.h>
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
 static enum AVCodecID chiaki_codec_av_codec_id(ChiakiCodec codec)
 {
@@ -105,6 +108,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 	decoder->codec_context->framerate = decoder->synthetic_framerate;
 	decoder->codec_context->pkt_timebase = decoder->synthetic_time_base;
 	decoder->codec_context->time_base = decoder->synthetic_time_base;
+#ifdef AV_CODEC_FLAG_COPY_OPAQUE
+	const char *trace = getenv("CHIAKI_VERBOSE_LOG_NOISE");
+	if(trace && strcmp(trace, "1") == 0)
+		decoder->codec_context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+#endif
 
 	if(avcodec_open2(decoder->codec_context, decoder->av_codec, NULL) < 0)
 	{
@@ -136,13 +144,14 @@ CHIAKI_EXPORT void chiaki_ffmpeg_decoder_fini(ChiakiFfmpegDecoder *decoder)
 CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
 {
 	ChiakiFfmpegDecoder *decoder = user;
+	const uint64_t sample_time_us = chiaki_time_now_monotonic_us();
 
 	chiaki_mutex_lock(&decoder->mutex);
 	decoder->frames_lost += frames_lost;
 	decoder->frame_recovered = frame_recovered;
 	if(decoder->synthetic_last_sample_time_us)
 	{
-		double observed_duration_us = (double)(chiaki_time_now_monotonic_us() - decoder->synthetic_last_sample_time_us);
+		double observed_duration_us = (double)(sample_time_us - decoder->synthetic_last_sample_time_us);
 		int64_t delivered_frames = (int64_t)frames_lost + 1;
 		double default_duration_us = chiaki_ffmpeg_decoder_default_frame_duration_us((unsigned int)decoder->synthetic_framerate.num);
 		if(delivered_frames > 1)
@@ -179,7 +188,7 @@ CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t bu
 			decoder->synthetic_candidate_count = 0;
 		}
 	}
-	decoder->synthetic_last_sample_time_us = chiaki_time_now_monotonic_us();
+	decoder->synthetic_last_sample_time_us = sample_time_us;
 
 	int64_t synthetic_duration_pts = (int64_t)(decoder->synthetic_frame_duration_us + 0.5);
 	if(synthetic_duration_pts < 1)
@@ -188,6 +197,16 @@ CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t bu
 		decoder->synthetic_packet_pts += synthetic_duration_pts * (int64_t)frames_lost;
 
 	AVPacket *packet = av_packet_alloc();
+	if(!packet)
+		goto hell;
+#ifdef AV_CODEC_FLAG_COPY_OPAQUE
+	if(decoder->codec_context->flags & AV_CODEC_FLAG_COPY_OPAQUE)
+	{
+		packet->opaque_ref = av_buffer_alloc(sizeof(sample_time_us));
+		if(packet->opaque_ref)
+			memcpy(packet->opaque_ref->data, &sample_time_us, sizeof(sample_time_us));
+	}
+#endif
 	packet->data = buf;
 	packet->size = buf_size;
 	packet->pts = decoder->synthetic_packet_pts;
@@ -291,6 +310,17 @@ CHIAKI_EXPORT ChiakiFfmpegFrame chiaki_ffmpeg_decoder_pull_frame(ChiakiFfmpegDec
 	frame_plus_stats.recovered = recovered;
 	if(frame)
 	{
+#ifdef AV_CODEC_FLAG_COPY_OPAQUE
+		if((decoder->codec_context->flags & AV_CODEC_FLAG_COPY_OPAQUE) &&
+		   frame->opaque_ref && frame->opaque_ref->size == sizeof(uint64_t))
+		{
+			uint64_t sample_time_us;
+			memcpy(&sample_time_us, frame->opaque_ref->data, sizeof(sample_time_us));
+			uint64_t ready_time_us = chiaki_time_now_monotonic_us();
+			if(ready_time_us >= sample_time_us)
+				CHIAKI_LOGD(decoder->log, "[decode] sample_to_frame_available_us=%" PRIu64, ready_time_us - sample_time_us);
+		}
+#endif
 		chiaki_ffmpeg_frame_get_timing(
 			frame,
 			pkt_timebase,

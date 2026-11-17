@@ -179,6 +179,8 @@ int real_main(int argc, char *argv[])
 
 	QCommandLineOption fullscreen_option("fullscreen", "Start window in fullscreen mode [maintains aspect ratio, adds black bars to fill unsused parts of screen if applicable] (only for use with stream command).");
 	parser.addOption(fullscreen_option);
+	QCommandLineOption borderless_window_option("borderless-window", "Start the stream in a borderless desktop window (stream command).");
+	parser.addOption(borderless_window_option);
 
 	QCommandLineOption dualsense_option("dualsense", "Enable DualSense haptics and adaptive triggers (PS5 and DualSense connected via USB only).");
 	parser.addOption(dualsense_option);
@@ -283,9 +285,10 @@ int real_main(int argc, char *argv[])
 				return 1;
 			}
 		}
-		if ((parser.isSet(stretch_option) && (parser.isSet(zoom_option) || parser.isSet(fullscreen_option))) || (parser.isSet(zoom_option) && parser.isSet(fullscreen_option)))
+		if (int(parser.isSet(fullscreen_option)) + int(parser.isSet(zoom_option)) +
+		    int(parser.isSet(stretch_option)) + int(parser.isSet(borderless_window_option)) > 1)
 		{
-			printf("Must choose between fullscreen, zoom or stretch option.");
+			printf("Choose only one of fullscreen, zoom, stretch or borderless-window.\n");
 			return 1;
 		}
 		if(parser.value(passcode_option).isEmpty())
@@ -316,6 +319,7 @@ int real_main(int argc, char *argv[])
 				parser.isSet(fullscreen_option),
 				parser.isSet(zoom_option),
 				parser.isSet(stretch_option));
+		connect_info.borderless_window = parser.isSet(borderless_window_option);
 
 		return RunStream(app, connect_info);
 	}

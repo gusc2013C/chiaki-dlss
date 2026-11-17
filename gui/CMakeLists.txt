@@ -85,6 +85,8 @@ elseif(WIN32)
 	list(APPEND SOURCE_FILES
 		include/windowsWakeSleep.h
 		src/windowsWakeSleep.cpp
+		include/windowsDisplayHdr.h
+		src/windowsDisplayHdr.cpp
 	)
 endif()
 
@@ -97,6 +99,9 @@ target_include_directories(chiaki PRIVATE include)
 add_library(placebo-libav-impl src/libav_impl.c)
 target_link_libraries(placebo-libav-impl PkgConfig::LIBPLACEBO FFMPEG::avcodec FFMPEG::avutil FFMPEG::avformat)
 target_link_libraries(chiaki PkgConfig::LIBPLACEBO placebo-libav-impl)
+if(WIN32)
+	target_link_libraries(chiaki dxgi)
+endif()
 
 target_link_libraries(chiaki chiaki-lib)
 if(CHIAKI_ENABLE_CLI)

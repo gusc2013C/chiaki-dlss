@@ -33,6 +33,7 @@ extern "C" {
 #include <vulkan/vulkan_metal.h>
 #elif defined(Q_OS_WIN)
 #include <vulkan/vulkan_win32.h>
+#include "windowsDisplayHdr.h"
 #endif
 
 Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
@@ -165,7 +166,8 @@ public slots:
     void updateVSync();
     void updateVulkanDeferredSwap();
     void show();
-    void presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us = 0);
+    void presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost,
+                      qint64 decoder_delivery_us = 0, qint64 decoder_ready_us = 0);
 
     AVBufferRef *vulkanHwDeviceCtx();
 
@@ -292,6 +294,7 @@ private:
     bool bypass_frame_queue = true;
     QMutex direct_frame_mutex;
     AVFrame *direct_pending_frame = nullptr;
+    qint64 direct_pending_decoder_ready_us = 0;
     struct pl_frame direct_frame = {};
     QAtomicInteger<int> direct_frame_reset = 0;
     uint64_t ts_start = 0;
@@ -303,6 +306,8 @@ private:
     bool amd_card = false;
     bool nvidia_card = false;
     bool direct_stream = false;
+    bool direct_start_fullscreen = false;
+    bool direct_start_borderless = false;
     std::atomic<qint64> queue_pts_origin_cached_us = -1;
     uint64_t next_frame_target_us = 0;
     double last_throttle_interval_s = 0.0;
@@ -465,6 +470,11 @@ private:
     const struct pl_hook *fsr_hook = nullptr;
     const struct pl_hook *fsrcnnx_hook_8 = nullptr;
     const struct pl_hook *fsrcnnx_hook_16 = nullptr;
+#ifdef Q_OS_WIN
+    std::atomic<WindowsDisplayHdr> windows_hdr_display{};
+    WindowsDisplayHdr applied_windows_hdr_display{};
+    void refreshWindowsDisplayHdr();
+#endif
 
     struct {
         PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;

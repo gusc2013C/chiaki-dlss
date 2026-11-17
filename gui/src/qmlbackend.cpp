@@ -1130,7 +1130,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         ChiakiFfmpegFrame frame = chiaki_ffmpeg_decoder_pull_frame(decoder, &frames_lost);
         if (!frame.frame)
             return;
-        logDecoderDeliveryStats(static_cast<qint64>(chiaki_time_now_monotonic_us()), frames_lost, frame.recovered);
+        const qint64 decoder_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+        logDecoderDeliveryStats(decoder_ready_us, frames_lost, frame.recovered);
         logDecoderFramePtsStats(static_cast<qint64>(chiaki_time_now_monotonic_us()), frame.pts, frame.duration);
         if (frame.recovered)
             pending_recovered_frame.storeRelaxed(1);
@@ -1154,8 +1155,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
 
         const qint64 delivery_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         QmlMainWindow *target_window = window;
-        QMetaObject::invokeMethod(target_window, [target_window, frame, frames_lost, delivery_us]() mutable {
-            target_window->presentFrame(frame, frames_lost, delivery_us);
+        QMetaObject::invokeMethod(target_window, [target_window, frame, frames_lost, delivery_us, decoder_ready_us]() mutable {
+            target_window->presentFrame(frame, frames_lost, delivery_us, decoder_ready_us);
         });
     });
 
@@ -2386,7 +2387,7 @@ void QmlBackend::prepareStartupPresentation(bool present_warmup)
 
 void QmlBackend::applyStartupWindowSizing()
 {
-    if (!window)
+    if (!window || session_info.borderless_window)
         return;
 
     const auto &connect_info = session_info;
