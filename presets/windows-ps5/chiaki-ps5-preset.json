@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "defaultProfile": "RtxVideo4K60",
+  "settings": {
+    "resolution_local_ps5": "1080p",
+    "bitrate_local_ps5": 50000,
+    "render_backend": "vulkan",
+    "hw_decoder": "auto",
+    "direct_frame_mapping": true,
+    "use_zero_copy": true,
+    "vsync": false,
+    "vulkan_deferred_swap": false,
+    "idr_on_fec_failure": true,
+    "placebo_preset": "fast",
+    "window_type": "Adjust Manually",
+    "display_target_prim": 0,
+    "display_target_trc": 0,
+    "display_target_peak": 0,
+    "display_target_contrast": 0,
+    "hdr_peak": 1400,
+    "hdr_black": -1,
+    "hdr_midtones": 100,
+    "hdr_saturation": 100,
+    "hdr_curve": 0,
+    "hdr_display_gamut": true
+  },
+  "profiles": {
+    "Native": {
+      "codec": "h265",
+      "sourceFps": 60,
+      "rtxVideoQuality": 0,
+      "frameGeneration": "off"
+    },
+    "RtxVideo4K": {
+      "codec": "h265",
+      "sourceFps": 30,
+      "rtxVideoQuality": 4,
+      "frameGeneration": "off"
+    },
+    "RtxVideo4K60": {
+      "codec": "h265",
+      "sourceFps": 30,
+      "rtxVideoQuality": 4,
+      "frameGeneration": "low"
+    },
+    "Hdr60": {
+      "codec": "h265_hdr",
+      "sourceFps": 30,
+      "rtxVideoQuality": 0,
+      "frameGeneration": "low"
+    }
+  }
+}
