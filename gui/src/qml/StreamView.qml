@@ -70,6 +70,7 @@ Item {
         Chiaki.window.setOverlayInteractionActive(
             menuController.open ||
             menuController.closing ||
+            hdrPanel.visible ||
             sessionStopDialogActive ||
             separateSessionStopWindow.visible ||
             sessionPinDialogActive ||
@@ -910,6 +911,150 @@ Item {
     }
 
     Popup {
+        id: hdrPanel
+        parent: view
+        width: Math.min(410, view.width - 24)
+        height: Math.min(hdrControls.implicitHeight + topPadding + bottomPadding, view.height - 24)
+        x: view.width - width - 12
+        y: Math.round((view.height - height) / 2)
+        padding: 18
+        focus: true
+        closePolicy: Popup.CloseOnEscape
+        onAboutToShow: {
+            view.grabInput(null);
+            view.updateOverlayInteractionActive();
+        }
+        onOpened: {
+            peakNits.forceActiveFocus(Qt.TabFocusReason);
+            view.updateOverlayInteractionActive();
+            Chiaki.window.requestOverlayUpdate();
+        }
+        onAboutToHide: view.releaseInput()
+        onClosed: {
+            view.updateOverlayInteractionActive();
+            Chiaki.window.requestOverlayUpdate();
+        }
+
+        contentItem: ScrollView {
+            id: hdrScroll
+            contentWidth: availableWidth
+            clip: true
+
+            ColumnLayout {
+                id: hdrControls
+                width: hdrScroll.availableWidth
+                spacing: 6
+
+                Label {
+                    text: qsTr("HDR calibration")
+                    font.pixelSize: 20
+                    font.bold: true
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: Chiaki.window.hdrActive
+                          ? qsTr("HDR10 · PQ · BT.2020")
+                          : qsTr("HDR10 calibration is inactive")
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: Chiaki.window.hdrDisplayPeak > 0
+                          ? qsTr("Display reports %1 nits").arg(Chiaki.window.hdrDisplayPeak)
+                          : qsTr("Display HDR peak unavailable")
+                }
+
+                GridLayout {
+                    Layout.fillWidth: true
+                    columns: 2
+                    columnSpacing: 12
+
+                    Label { text: qsTr("Peak (nits)") }
+                    SpinBox {
+                        id: peakNits
+                        Layout.fillWidth: true
+                        from: 0
+                        to: 10000
+                        stepSize: 50
+                        value: Chiaki.settings.hdrPeak
+                        editable: true
+                        Accessible.name: qsTr("Peak (nits), 0 for automatic")
+                        onValueModified: Chiaki.settings.hdrPeak = value
+                    }
+                    Label { text: qsTr("Black (millinits)") }
+                    SpinBox {
+                        Layout.fillWidth: true
+                        from: -1
+                        to: 1000
+                        value: Chiaki.settings.hdrBlack
+                        editable: true
+                        Accessible.name: qsTr("Black (millinits), -1 for automatic")
+                        onValueModified: Chiaki.settings.hdrBlack = value
+                    }
+                    Label { text: qsTr("PQ tone mapping") }
+                    ComboBox {
+                        Layout.fillWidth: true
+                        model: [qsTr("Spline"), "BT.2390"]
+                        currentIndex: Chiaki.settings.hdrCurve
+                        Accessible.name: qsTr("PQ tone mapping")
+                        onActivated: Chiaki.settings.hdrCurve = currentIndex
+                    }
+                    Label { text: qsTr("Midtone contrast") }
+                    RowLayout {
+                        enabled: Chiaki.settings.hdrCurve === 0
+                        Slider {
+                            Layout.fillWidth: true
+                            from: 75
+                            to: 130
+                            stepSize: 1
+                            value: Chiaki.settings.hdrMidtones
+                            Accessible.name: qsTr("Midtone contrast")
+                            onMoved: Chiaki.settings.hdrMidtones = Math.round(value)
+                        }
+                        Label { text: qsTr("%1%").arg(Chiaki.settings.hdrMidtones) }
+                    }
+                    Label { text: qsTr("Saturation") }
+                    RowLayout {
+                        Slider {
+                            Layout.fillWidth: true
+                            from: 50
+                            to: 150
+                            stepSize: 1
+                            value: Chiaki.settings.hdrSaturation
+                            Accessible.name: qsTr("Saturation")
+                            onMoved: Chiaki.settings.hdrSaturation = Math.round(value)
+                        }
+                        Label { text: qsTr("%1%").arg(Chiaki.settings.hdrSaturation) }
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: qsTr("Auto values: peak 0, black −1")
+                }
+                CheckBox {
+                    text: qsTr("Map to display gamut")
+                    checked: Chiaki.settings.hdrDisplayGamut
+                    enabled: Chiaki.window.hdrDisplayGamutAvailable
+                    onToggled: Chiaki.settings.hdrDisplayGamut = checked
+                }
+                RowLayout {
+                    Layout.alignment: Qt.AlignRight
+                    Button {
+                        text: qsTr("Reset")
+                        onClicked: Chiaki.settings.resetHdrCalibration()
+                    }
+                    Button {
+                        text: qsTr("Close")
+                        onClicked: hdrPanel.close()
+                    }
+                }
+            }
+        }
+    }
+
+    Popup {
         id: sessionStopDialog
         property int closeAction: 0
         parent: Overlay.overlay
@@ -1246,6 +1391,7 @@ Item {
         function onSessionPinDialogRequested() {
             if (sessionPinDialog.opened || separateSessionPinWindow.visible)
                 return;
+            hdrPanel.close();
             menuController.close();
             if (useSeparateMenuWindow)
                 separateSessionPinWindow.visible = true;
@@ -1257,6 +1403,7 @@ Item {
         function onSessionStopDialogRequested() {
             if (sessionStopDialog.opened || separateSessionStopWindow.visible)
                 return;
+            hdrPanel.close();
             menuController.close();
             if (useSeparateMenuWindow)
                 separateSessionStopWindow.visible = true;
@@ -1282,16 +1429,30 @@ Item {
         function onMenuRequested() {
             if (sessionPinDialog.opened || sessionStopDialog.opened || separateSessionPinWindow.visible || separateSessionStopWindow.visible)
                 return;
+            hdrPanel.close();
             menuController.toggle();
             Chiaki.window.requestOverlayUpdate();
+        }
+
+        function onHdrPanelRequested() {
+            if (sessionPinDialogActive || sessionStopDialogActive || sessionLoading)
+                return;
+            if (hdrPanel.visible) {
+                hdrPanel.close();
+            } else {
+                menuController.close();
+                hdrPanel.open();
+            }
         }
     }
     Connections {
         target: Chiaki
 
         function onSessionChanged() {
-            if (!Chiaki.session)
+            if (!Chiaki.session) {
+                hdrPanel.close();
                 menuController.close();
+            }
         }
     }
     Connections {

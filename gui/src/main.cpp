@@ -181,6 +181,10 @@ int real_main(int argc, char *argv[])
 	parser.addOption(fullscreen_option);
 	QCommandLineOption borderless_window_option("borderless-window", "Start the stream in a borderless desktop window (stream command).");
 	parser.addOption(borderless_window_option);
+	QCommandLineOption borderless_fullscreen_option("borderless-fullscreen", "Cover the display with a borderless desktop window (stream command).");
+	parser.addOption(borderless_fullscreen_option);
+	QCommandLineOption source_fps_option("source-fps", "Request 30 or 60 fps from the console for this stream.", "fps");
+	parser.addOption(source_fps_option);
 
 	QCommandLineOption dualsense_option("dualsense", "Enable DualSense haptics and adaptive triggers (PS5 and DualSense connected via USB only).");
 	parser.addOption(dualsense_option);
@@ -286,9 +290,10 @@ int real_main(int argc, char *argv[])
 			}
 		}
 		if (int(parser.isSet(fullscreen_option)) + int(parser.isSet(zoom_option)) +
-		    int(parser.isSet(stretch_option)) + int(parser.isSet(borderless_window_option)) > 1)
+		    int(parser.isSet(stretch_option)) + int(parser.isSet(borderless_window_option)) +
+		    int(parser.isSet(borderless_fullscreen_option)) > 1)
 		{
-			printf("Choose only one of fullscreen, zoom, stretch or borderless-window.\n");
+			printf("Choose only one of fullscreen, zoom, stretch, borderless-window or borderless-fullscreen.\n");
 			return 1;
 		}
 		if(parser.value(passcode_option).isEmpty())
@@ -319,7 +324,16 @@ int real_main(int argc, char *argv[])
 				parser.isSet(fullscreen_option),
 				parser.isSet(zoom_option),
 				parser.isSet(stretch_option));
-		connect_info.borderless_window = parser.isSet(borderless_window_option);
+		connect_info.borderless_fullscreen = parser.isSet(borderless_fullscreen_option);
+		connect_info.borderless_window = parser.isSet(borderless_window_option) || connect_info.borderless_fullscreen;
+		if(parser.isSet(source_fps_option)) {
+			const auto value = parser.value(source_fps_option);
+			if(value != "30" && value != "60") {
+				printf("--source-fps must be 30 or 60.\n");
+				return 1;
+			}
+			connect_info.video_profile.max_fps = value.toUInt();
+		}
 
 		return RunStream(app, connect_info);
 	}

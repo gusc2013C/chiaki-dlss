@@ -1184,6 +1184,19 @@ void Settings::SetDisplayTargetContrast(int contrast)
 	settings.setValue("settings/display_target_contrast", contrast);
 }
 
+int Settings::GetHdrPeak() const { return qBound(0, settings.value("settings/hdr_peak", 0).toInt(), 10000); }
+void Settings::SetHdrPeak(int value) { settings.setValue("settings/hdr_peak", qBound(0, value, 10000)); }
+int Settings::GetHdrBlack() const { return qBound(-1, settings.value("settings/hdr_black", -1).toInt(), 1000); }
+void Settings::SetHdrBlack(int value) { settings.setValue("settings/hdr_black", qBound(-1, value, 1000)); }
+int Settings::GetHdrMidtones() const { return qBound(75, settings.value("settings/hdr_midtones", 100).toInt(), 130); }
+void Settings::SetHdrMidtones(int value) { settings.setValue("settings/hdr_midtones", qBound(75, value, 130)); }
+int Settings::GetHdrSaturation() const { return qBound(50, settings.value("settings/hdr_saturation", 100).toInt(), 150); }
+void Settings::SetHdrSaturation(int value) { settings.setValue("settings/hdr_saturation", qBound(50, value, 150)); }
+int Settings::GetHdrCurve() const { return qBound(0, settings.value("settings/hdr_curve", 0).toInt(), 1); }
+void Settings::SetHdrCurve(int value) { settings.setValue("settings/hdr_curve", qBound(0, value, 1)); }
+bool Settings::GetHdrDisplayGamut() const { return settings.value("settings/hdr_display_gamut", true).toBool(); }
+void Settings::SetHdrDisplayGamut(bool enabled) { settings.setValue("settings/hdr_display_gamut", enabled); }
+
 int Settings::GetDisplayTargetPeak() const
 {
 	return settings.value("settings/display_target_peak", 0).toInt();

@@ -489,6 +489,30 @@ void QmlSettings::setDisplayTargetContrast(int contrast)
     emit displayTargetContrastChanged();
 }
 
+int QmlSettings::hdrPeak() const { return settings->GetHdrPeak(); }
+void QmlSettings::setHdrPeak(int value) { settings->SetHdrPeak(value); emit hdrCalibrationChanged(); }
+int QmlSettings::hdrBlack() const { return settings->GetHdrBlack(); }
+void QmlSettings::setHdrBlack(int value) { settings->SetHdrBlack(value); emit hdrCalibrationChanged(); }
+int QmlSettings::hdrMidtones() const { return settings->GetHdrMidtones(); }
+void QmlSettings::setHdrMidtones(int value) { settings->SetHdrMidtones(value); emit hdrCalibrationChanged(); }
+int QmlSettings::hdrSaturation() const { return settings->GetHdrSaturation(); }
+void QmlSettings::setHdrSaturation(int value) { settings->SetHdrSaturation(value); emit hdrCalibrationChanged(); }
+int QmlSettings::hdrCurve() const { return settings->GetHdrCurve(); }
+void QmlSettings::setHdrCurve(int value) { settings->SetHdrCurve(value); emit hdrCalibrationChanged(); }
+bool QmlSettings::hdrDisplayGamut() const { return settings->GetHdrDisplayGamut(); }
+void QmlSettings::setHdrDisplayGamut(bool enabled) { settings->SetHdrDisplayGamut(enabled); emit hdrCalibrationChanged(); }
+
+void QmlSettings::resetHdrCalibration()
+{
+    settings->SetHdrPeak(0);
+    settings->SetHdrBlack(-1);
+    settings->SetHdrMidtones(100);
+    settings->SetHdrSaturation(100);
+    settings->SetHdrCurve(0);
+    settings->SetHdrDisplayGamut(true);
+    emit hdrCalibrationChanged();
+}
+
 int QmlSettings::displayTargetPeak() const
 {
     return settings->GetDisplayTargetPeak();
@@ -1912,6 +1936,7 @@ void QmlSettings::refreshAllKeys()
     emit displayTargetPeakChanged();
     emit displayTargetPrimChanged();
     emit displayTargetTrcChanged();
+    emit hdrCalibrationChanged();
     emit fullscreenDoubleClickChanged();
     emit fpsLocalPS4Changed();
     emit fpsRemotePS4Changed();

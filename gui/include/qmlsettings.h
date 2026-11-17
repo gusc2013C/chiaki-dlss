@@ -35,6 +35,12 @@ class QmlSettings : public QObject
     Q_PROPERTY(float hapticOverride READ hapticOverride WRITE setHapticOverride NOTIFY hapticOverrideChanged)
     Q_PROPERTY(int displayTargetContrast READ displayTargetContrast WRITE setDisplayTargetContrast NOTIFY displayTargetContrastChanged)
     Q_PROPERTY(int displayTargetPeak READ displayTargetPeak WRITE setDisplayTargetPeak NOTIFY displayTargetPeakChanged)
+    Q_PROPERTY(int hdrPeak READ hdrPeak WRITE setHdrPeak NOTIFY hdrCalibrationChanged)
+    Q_PROPERTY(int hdrBlack READ hdrBlack WRITE setHdrBlack NOTIFY hdrCalibrationChanged)
+    Q_PROPERTY(int hdrMidtones READ hdrMidtones WRITE setHdrMidtones NOTIFY hdrCalibrationChanged)
+    Q_PROPERTY(int hdrSaturation READ hdrSaturation WRITE setHdrSaturation NOTIFY hdrCalibrationChanged)
+    Q_PROPERTY(int hdrCurve READ hdrCurve WRITE setHdrCurve NOTIFY hdrCalibrationChanged)
+    Q_PROPERTY(bool hdrDisplayGamut READ hdrDisplayGamut WRITE setHdrDisplayGamut NOTIFY hdrCalibrationChanged)
     Q_PROPERTY(int displayTargetPrim READ displayTargetPrim WRITE setDisplayTargetPrim NOTIFY displayTargetPrimChanged)
     Q_PROPERTY(int displayTargetTrc READ displayTargetTrc WRITE setDisplayTargetTrc NOTIFY displayTargetTrcChanged)
     Q_PROPERTY(bool fullscreenDoubleClick READ fullscreenDoubleClick WRITE setFullscreenDoubleClick NOTIFY fullscreenDoubleClickChanged)
@@ -187,6 +193,19 @@ public:
     void setDisplayTargetContrast(int contrast);
 
     int displayTargetPeak() const;
+    int hdrPeak() const;
+    void setHdrPeak(int value);
+    int hdrBlack() const;
+    void setHdrBlack(int value);
+    int hdrMidtones() const;
+    void setHdrMidtones(int value);
+    int hdrSaturation() const;
+    void setHdrSaturation(int value);
+    int hdrCurve() const;
+    void setHdrCurve(int value);
+    bool hdrDisplayGamut() const;
+    void setHdrDisplayGamut(bool enabled);
+    Q_INVOKABLE void resetHdrCalibration();
     void setDisplayTargetPeak(int peak);
 
     int displayTargetPrim() const;
@@ -654,6 +673,7 @@ signals:
     void codecRemotePS5Changed();
     void vulkanDeferredSwapChanged();
     void displayTargetPeakChanged();
+    void hdrCalibrationChanged();
     void displayTargetContrastChanged();
     void displayTargetPrimChanged();
     void displayTargetTrcChanged();

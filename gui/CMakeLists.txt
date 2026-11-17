@@ -87,6 +87,10 @@ elseif(WIN32)
 		src/windowsWakeSleep.cpp
 		include/windowsDisplayHdr.h
 		src/windowsDisplayHdr.cpp
+		include/windowsVideoEnhancer.h
+		src/windowsVideoEnhancer.cpp
+		include/windowsVrr.h
+		src/windowsVrr.cpp
 	)
 endif()
 

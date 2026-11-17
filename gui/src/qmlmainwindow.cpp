@@ -34,6 +34,7 @@ extern "C" {
 #include <QWidget>
 #include <QLabel>
 #include <QVBoxLayout>
+#include <QVarLengthArray>
 #include <QHBoxLayout>
 #include <QFrame>
 #include <QOpenGLContext>
@@ -482,6 +483,73 @@ private:
     qint64 wakeup_target_us = 0;
     quint64 generation = 0;
 };
+
+#ifdef Q_OS_WIN
+class VfgPresentationTimer final : public QThread
+{
+public:
+    explicit VfgPresentationTimer(QmlMainWindow *owner) : owner(owner)
+    {
+        // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION may be absent in older headers.
+        timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002, TIMER_ALL_ACCESS);
+        stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (timer && stop)
+            start(QThread::HighPriority);
+    }
+
+    ~VfgPresentationTimer() override
+    {
+        if (stop)
+            SetEvent(stop);
+        wait();
+        if (timer)
+            CloseHandle(timer);
+        if (stop)
+            CloseHandle(stop);
+    }
+
+    bool arm(qint64 due_us, quint64 next_generation)
+    {
+        if (!timer || !stop)
+            return false;
+        QMutexLocker lock(&mutex);
+        deadline = due_us;
+        generation = next_generation;
+        return setDeadline();
+    }
+
+protected:
+    void run() override
+    {
+        const HANDLE handles[] = {stop, timer};
+        while (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+            QMutexLocker lock(&mutex);
+            if (qint64(chiaki_time_now_monotonic_us()) < deadline && setDeadline())
+                continue;
+            QMetaObject::invokeMethod(owner, [owner = this->owner, token = generation] {
+                if (owner->windows_vfg_timer_generation.loadAcquire() == token &&
+                    owner->stream_session_active.loadAcquire())
+                    owner->scheduleUpdate(true, QmlMainWindow::UpdateRequestReason::Timer);
+            }, Qt::QueuedConnection);
+        }
+    }
+
+private:
+    bool setDeadline()
+    {
+        LARGE_INTEGER relative{};
+        relative.QuadPart = -10 * qMax<qint64>(1, deadline - qint64(chiaki_time_now_monotonic_us()));
+        return SetWaitableTimer(timer, &relative, 0, nullptr, nullptr, FALSE) != FALSE;
+    }
+
+    QmlMainWindow *owner;
+    HANDLE timer = nullptr;
+    HANDLE stop = nullptr;
+    QMutex mutex;
+    qint64 deadline = 0;
+    quint64 generation = 0;
+};
+#endif
 
 struct DeferredSwapTask
 {
@@ -2541,6 +2609,7 @@ QmlMainWindow::QmlMainWindow(const StreamSessionConnectInfo &connect_info)
     direct_stream = true;
     direct_start_fullscreen = connect_info.fullscreen || connect_info.zoom || connect_info.stretch;
     direct_start_borderless = connect_info.borderless_window;
+    direct_cover_display = connect_info.borderless_fullscreen;
     emit directStreamChanged();
     init(connect_info.settings);
     backend->createSession(connect_info);
@@ -2570,6 +2639,9 @@ QmlMainWindow::~QmlMainWindow()
     }
 
     drainRenderThread();
+#ifdef Q_OS_WIN
+    windows_vfg_timer.reset();
+#endif
 
     if (buffered_pace_thread) {
         buffered_pace_thread->stopThread();
@@ -2619,6 +2691,10 @@ QmlMainWindow::~QmlMainWindow()
 #endif
 
     if (pl_gpu gpu = placeboGpu()) {
+#ifdef Q_OS_WIN
+        windows_vfg.reset();
+        windows_sr.reset();
+#endif
         pl_unmap_avframe(gpu, &direct_frame);
         if (quick_tex)
             pl_tex_destroy(gpu, &quick_tex);
@@ -2682,6 +2758,7 @@ QmlMainWindow::~QmlMainWindow()
     // User shader hooks hold a reference to the GPU (their descriptors destroy
     // buffers/textures via p->gpu), so they must be released before the GPU is.
     pl_mpv_user_shader_destroy(&fsr_hook);
+    pl_mpv_user_shader_destroy(&stream_deblock_hook);
     pl_mpv_user_shader_destroy(&fsrcnnx_hook_8);
     pl_mpv_user_shader_destroy(&fsrcnnx_hook_16);
     if (render_backend == RenderBackend::Vulkan) {
@@ -2918,10 +2995,13 @@ void QmlMainWindow::show()
         return;
     }
     if (direct_start_borderless) {
-        const QRect work = (screen() ? screen() : QGuiApplication::primaryScreen())->availableGeometry();
-        const QSize size = QSize(1280, 800).boundedTo(work.size());
-        QRect bounds{QPoint{}, size};
-        bounds.moveCenter(work.center());
+        const auto *display = screen() ? screen() : QGuiApplication::primaryScreen();
+        QRect bounds = display->geometry();
+        if (!direct_cover_display) {
+            const QRect work = display->availableGeometry();
+            bounds = QRect{QPoint{}, QSize(1280, 800).boundedTo(work.size())};
+            bounds.moveCenter(work.center());
+        }
         setFlag(Qt::FramelessWindowHint);
         setGeometry(bounds);
         showNormal();
@@ -4851,13 +4931,79 @@ void QmlMainWindow::doneOpenGLContextCurrent()
     }, Qt::BlockingQueuedConnection);
 }
 
+bool QmlMainWindow::hdrActive() const
+{
+    return hdr_active.loadRelaxed() != 0;
+}
+
+int QmlMainWindow::hdrDisplayPeak() const
+{
+#ifdef Q_OS_WIN
+    QMutexLocker lock(&windows_hdr_lock);
+    return qRound(windows_hdr_display.peak_nits);
+#else
+    return 0;
+#endif
+}
+
+bool QmlMainWindow::hdrDisplayGamutAvailable() const
+{
+#ifdef Q_OS_WIN
+    QMutexLocker lock(&windows_hdr_lock);
+    return pl_primaries_compatible(&windows_hdr_display.primaries,
+                                  pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020));
+#else
+    return false;
+#endif
+}
+
 #ifdef Q_OS_WIN
 void QmlMainWindow::refreshWindowsDisplayHdr()
 {
     const auto display = queryWindowsDisplayHdr(reinterpret_cast<HWND>(winId()));
-    const auto previous = windows_hdr_display.exchange(display, std::memory_order_relaxed);
+    WindowsDisplayHdr previous;
+    {
+        QMutexLocker lock(&windows_hdr_lock);
+        previous = windows_hdr_display;
+        windows_hdr_display = display;
+    }
     if (previous.peak_nits != display.peak_nits || previous.black_nits != display.black_nits)
         qCInfo(chiakiGui) << "Windows HDR display range (nits):" << display.black_nits << display.peak_nits;
+    if (previous.peak_nits != display.peak_nits ||
+        !pl_raw_primaries_equal(&previous.primaries, &display.primaries)) {
+        emit hdrStatusChanged();
+        requestOverlayUpdate();
+    }
+}
+
+void QmlMainWindow::refreshHdrCalibration()
+{
+    HdrCalibration calibration;
+    calibration.peak = settings->GetHdrPeak();
+    calibration.black = settings->GetHdrBlack();
+    calibration.midtones = settings->GetHdrMidtones();
+    calibration.saturation = settings->GetHdrSaturation();
+    calibration.curve = settings->GetHdrCurve();
+    calibration.display_gamut = settings->GetHdrDisplayGamut();
+    {
+        QMutexLocker lock(&windows_hdr_lock);
+        if (calibration == hdr_calibration)
+            return;
+        hdr_calibration = calibration;
+    }
+    requestOverlayUpdate();
+}
+
+void QmlMainWindow::scheduleVfgDeadline(qint64 due_us)
+{
+    const auto generation = windows_vfg_timer_generation.fetchAndAddOrdered(1) + 1;
+    if (windows_vfg_timer && windows_vfg_timer->arm(due_us, generation))
+        return;
+    const auto delay = qMax<qint64>(1, (due_us - qint64(chiaki_time_now_monotonic_us()) + 999) / 1000);
+    QTimer::singleShot(int(delay), Qt::PreciseTimer, this, [this, generation] {
+        if (windows_vfg_timer_generation.loadAcquire() == generation && stream_session_active.loadAcquire())
+            scheduleUpdate(true, UpdateRequestReason::Timer);
+    });
 }
 #endif
 
@@ -5051,6 +5197,10 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
             VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME,
             VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME,
             VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME,
+#ifdef Q_OS_WIN
+            VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+            VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+#endif
         };
 
         struct pl_vulkan_params vulkan_params = {
@@ -5060,8 +5210,17 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
             PL_VULKAN_DEFAULTS
             .extra_queues = VK_QUEUE_VIDEO_DECODE_BIT_KHR,
             .opt_extensions = opt_dev_extensions,
-            .num_opt_extensions = 4,
+            .num_opt_extensions = static_cast<int>(std::size(opt_dev_extensions)),
         };
+#ifdef Q_OS_WIN
+        if (WindowsVideoEnhancer::requested(WindowsVideoEnhancer::Mode::FrameGeneration) ||
+            WindowsVideoEnhancer::requested(WindowsVideoEnhancer::Mode::SuperResolution)) {
+            // Shared textures transfer ownership between D3D12 and one Vulkan
+            // graphics queue family. FFmpeg still gets its video decode queue.
+            vulkan_params.async_compute = false;
+            vulkan_params.async_transfer = false;
+        }
+#endif
         placebo_vulkan = pl_vulkan_create(placebo_log, &vulkan_params);
         if (!placebo_vulkan) {
             fallbackToOpenGL(QStringLiteral("Failed to create Vulkan device"));
@@ -5174,6 +5333,11 @@ renderer_backend_ready:
 
     present_pace_thread = new DeferredPresentPacerThread(this);
     present_pace_thread->start();
+#ifdef Q_OS_WIN
+    if (bypass_frame_queue && render_backend == RenderBackend::Vulkan &&
+        WindowsVideoEnhancer::requested(WindowsVideoEnhancer::Mode::FrameGeneration))
+        windows_vfg_timer = std::make_unique<VfgPresentationTimer>(this);
+#endif
 
     vulkan_deferred_swap_enabled = settings->GetVulkanDeferredSwap();
     deferred_swap_thread = new DeferredSwapThread(this);
@@ -5186,6 +5350,11 @@ renderer_backend_ready:
     connect(qml_engine, &QQmlEngine::quit, this, &QWindow::close);
 
     backend = new QmlBackend(settings, this);
+#ifdef Q_OS_WIN
+    connect(backend->qmlSettings(), &QmlSettings::hdrCalibrationChanged,
+            this, &QmlMainWindow::refreshHdrCalibration);
+    refreshHdrCalibration();
+#endif
     stats_overlay_widget = new StatsOverlayWidget(this, backend);
     connect(backend, &QmlBackend::sessionChanged, this, [this, exit_app_on_stream_exit](StreamSession *s) {
         const bool preserve_startup_warmup = s && startup_warmup_preserve_next_session_change;
@@ -5199,8 +5368,11 @@ renderer_backend_ready:
         // Only drain at session end (teardown): prevents frame_mix use-after-free.
         // At session start draining would visibly freeze the connecting UI, so the
         // queue reset below waits only for a render that is drawing queued frames.
-        if (!s)
+        if (!s) {
             drainRenderThread();
+            if (hdr_active.fetchAndStoreRelaxed(0) != 0)
+                emit hdrStatusChanged();
+        }
         if (!preserve_startup_warmup) {
             {
                 QMutexLocker locker(&direct_frame_mutex);
@@ -5355,6 +5527,11 @@ renderer_backend_ready:
     pl_options_reset(this->renderparams_opts, &pl_render_high_quality_params);
     this->renderparams_changed = true;
     this->fsr_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSR.glsl"));
+    if (qEnvironmentVariableIntValue("CHIAKI_STREAM_CLEANUP") == 1) {
+        stream_deblock_hook = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/StreamDeblock.glsl"));
+        if (stream_deblock_hook)
+            qCInfo(chiakiGui) << "Remote Play spatial deblock/deband enabled";
+    }
     this->fsrcnnx_hook_8 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_8-0-4-1.glsl"));
     this->fsrcnnx_hook_16 = load_mpv_hook(placeboGpu(), QStringLiteral(":/shaders/FSRCNNX_x2_16-0-4-1.glsl"));
 
@@ -5491,7 +5668,7 @@ void QmlMainWindow::scheduleUpdate(bool force, UpdateRequestReason reason)
         force = true;
     }
 
-    if (force && reason == UpdateRequestReason::PendingFrame) {
+    if (force && (reason == UpdateRequestReason::PendingFrame || reason == UpdateRequestReason::Timer)) {
         last_update_request_reason.storeRelaxed(static_cast<int>(reason));
         const qint64 schedule_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         last_schedule_update_us.storeRelease(schedule_us);
@@ -6057,16 +6234,32 @@ void QmlMainWindow::createSwapchain()
     surface_create_failure_first_us = 0;
 
     const int swapchain_depth = 1;
+    vrr_present_mode = false;
+#ifdef Q_OS_WIN
+    if (qEnvironmentVariableIntValue("CHIAKI_VRR") == 1) {
+        const auto vrr = queryWindowsVrr(surfaceInfo.hwnd);
+        vrr_present_mode = vrr.available && vrr.possible;
+        qCInfo(chiakiGui) << "Windows VRR: available=" << vrr.available
+                         << "possible=" << vrr.possible << "requested=" << vrr.requested
+                         << "active=" << vrr.active;
+        const HWND window = surfaceInfo.hwnd;
+        QTimer::singleShot(1500, this, [window] {
+            const auto current = queryWindowsVrr(window);
+            qCInfo(chiakiGui) << "Windows VRR after presentation: requested=" << current.requested
+                             << "enabled=" << current.enabled << "active=" << current.active;
+        });
+    }
+#endif
+    const bool synchronized_present = settings->GetVSyncEnabled() || vrr_present_mode;
     struct pl_vulkan_swapchain_params swapchain_params = {
         .surface = surface,
-        // Prefer MAILBOX for vsync (lower) latency when supported).
-        .present_mode = settings->GetVSyncEnabled() ? VK_PRESENT_MODE_FIFO_KHR
-                                                    : VK_PRESENT_MODE_IMMEDIATE_KHR,
+        .present_mode = synchronized_present ? VK_PRESENT_MODE_FIFO_KHR
+                                             : VK_PRESENT_MODE_IMMEDIATE_KHR,
         .swapchain_depth = swapchain_depth,
     };
     placebo_swapchain = pl_vulkan_create_swapchain(placebo_vulkan, &swapchain_params);
     present_vsync_enabled = swapchain_params.present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR;
-    if (!placebo_swapchain && !settings->GetVSyncEnabled()) {
+    if (!placebo_swapchain && !synchronized_present) {
         qCWarning(chiakiGui) << "Immediate present mode unsupported, falling back to FIFO VSync";
         swapchain_params.present_mode = VK_PRESENT_MODE_FIFO_KHR;
         swapchain_params.swapchain_depth = 1;
@@ -6075,7 +6268,8 @@ void QmlMainWindow::createSwapchain()
     }
     qCInfo(chiakiGui).nospace()
         << "[present] swapchain_create vsync_setting=" << (settings->GetVSyncEnabled() ? 1 : 0)
-        << " requested_mode=" << (settings->GetVSyncEnabled() ? "FIFO" : "IMMEDIATE")
+        << " vrr_present_mode=" << (vrr_present_mode ? 1 : 0)
+        << " requested_mode=" << (synchronized_present ? "FIFO" : "IMMEDIATE")
         << " selected_mode="
         << (swapchain_params.present_mode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO"
             : swapchain_params.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE"
@@ -6769,6 +6963,13 @@ void QmlMainWindow::render()
     }
 
     struct pl_render_params params = *render_params;
+    static const struct pl_deband_params stream_deband = [] {
+        auto deband = pl_deband_default_params;
+        deband.threshold = 2.5f;
+        deband.radius = 12.0f;
+        deband.grain = 0.0f;
+        return deband;
+    }();
     params.frame_mixer = effectiveFrameMixerConfig(&params);
     const bool content_timed = params.frame_mixer == nullptr;
     const bool mixer_active = params.frame_mixer != nullptr;
@@ -6819,6 +7020,9 @@ void QmlMainWindow::render()
     // pl_frame_mix timestamps are float before libplacebo API 387 and double from it
     const std::remove_cv_t<std::remove_pointer_t<decltype(pl_frame_mix::timestamps)>> direct_timestamps[] = { 0 };
     qint64 direct_decoder_ready_us = 0;
+    bool vfg_new_midpoint = false;
+    bool vfg_real_at_deadline = false;
+    bool sr_processed = false;
     if (bypass_frame_queue) {
         AVFrame *incoming = nullptr;
         bool reset_direct_frame = false;
@@ -6833,7 +7037,20 @@ void QmlMainWindow::render()
         if (reset_direct_frame) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
+#ifdef Q_OS_WIN
+            windows_sr_frame = {};
+            windows_sr_last_real_us = 0;
+            windows_video_sample_count = 0;
+            logged_decoded_hdr = false;
+            windows_vfg_midpoint = {};
+            windows_vfg_next_due_us = windows_vfg_last_real_us = 0;
+            windows_vfg_timer_generation.fetchAndAddRelaxed(1);
+#endif
         }
+#ifdef Q_OS_WIN
+        const bool warmup_frame = incoming && direct_decoder_ready_us == 0;
+        const bool decode_discontinuity = incoming && incoming->decode_error_flags != 0;
+#endif
         if (incoming) {
             pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
@@ -6851,12 +7068,127 @@ void QmlMainWindow::render()
             av_frame_free(&incoming);
         }
         direct_render_frame = direct_frame;
+#ifdef Q_OS_WIN
+        using EnhanceMode = WindowsVideoEnhancer::Mode;
+        const bool gpu_video = render_backend == RenderBackend::Vulkan && direct_frame.num_planes > 0;
+        const bool sr_requested = gpu_video && WindowsVideoEnhancer::requested(EnhanceMode::SuperResolution);
+        const bool vfg_requested = gpu_video && stream_configured_frame_interval_ms > 30.0 &&
+                                   WindowsVideoEnhancer::requested(EnhanceMode::FrameGeneration);
+        if (sr_requested && !windows_sr)
+            windows_sr = std::make_unique<WindowsVideoEnhancer>(placebo_vulkan,
+                placebo_vk_inst->get_proc_addr, EnhanceMode::SuperResolution, vfg_requested);
+        if (warmup_frame && gpu_video) {
+            // Build the feature and import its textures while Remote Play is connecting.
+            int width = int(pl_rect_w(direct_frame.crop));
+            int height = int(pl_rect_h(direct_frame.crop));
+            if (sr_requested && windows_sr->prepare(width, height, direct_frame.color)) {
+                width = WindowsVideoEnhancer::scaledExtent(width);
+                height = WindowsVideoEnhancer::scaledExtent(height);
+            }
+            if (!windows_vfg && vfg_requested && !(windows_sr && windows_sr->generatesFrames())) {
+                windows_vfg = std::make_unique<WindowsVideoEnhancer>(placebo_vulkan,
+                    placebo_vk_inst->get_proc_addr, EnhanceMode::FrameGeneration);
+                windows_vfg->prepare(width, height, direct_frame.color);
+            }
+        }
+        const auto now_us = vfg_requested ? qint64(chiaki_time_now_monotonic_us()) : 0;
+        const auto vfg_gap = direct_decoder_ready_us - windows_vfg_last_real_us;
+        const bool reset_vfg = vfg_requested && (decode_discontinuity || !windows_vfg_last_real_us ||
+            vfg_gap < 19000 || vfg_gap > 52000 || now_us - direct_decoder_ready_us > 8000 ||
+            windows_vfg_next_due_us != 0);
+        pl_frame combined_midpoint{};
+        if (sr_requested) {
+            if (direct_decoder_ready_us > 0) {
+                const auto gap = direct_decoder_ready_us - windows_sr_last_real_us;
+                const bool reset = decode_discontinuity || !windows_sr_last_real_us ||
+                    gap > qint64(2 * stream_configured_frame_interval_ms * 1000) ||
+                    (windows_sr->generatesFrames() && reset_vfg);
+                windows_sr_last_real_us = direct_decoder_ready_us;
+                windows_sr_frame = windows_sr->process(direct_frame, direct_frame.color, reset, &combined_midpoint);
+                sr_processed = windows_sr_frame.num_planes > 0;
+            }
+            if (windows_sr_frame.num_planes > 0)
+                direct_render_frame = windows_sr_frame;
+        }
+        if (vfg_requested) {
+            const auto half_interval_us = qint64(stream_configured_frame_interval_ms * 500.0 + 0.5);
+            if (direct_decoder_ready_us > 0) {
+                windows_vfg_next_due_us = 0;
+                windows_vfg_last_real_us = direct_decoder_ready_us;
+                windows_vfg_timer_generation.fetchAndAddOrdered(1);
+                if (sr_processed && windows_sr->generatesFrames()) {
+                    windows_vfg_midpoint = combined_midpoint;
+                } else {
+                    if (!windows_vfg)
+                        windows_vfg = std::make_unique<WindowsVideoEnhancer>(placebo_vulkan,
+                            placebo_vk_inst->get_proc_addr, EnhanceMode::FrameGeneration);
+                    windows_vfg->process(direct_render_frame, direct_frame.color, reset_vfg, &windows_vfg_midpoint);
+                }
+                if (windows_vfg_midpoint.num_planes > 0) {
+                    vfg_new_midpoint = true;
+                    windows_vfg_next_due_us = direct_decoder_ready_us + half_interval_us;
+                    scheduleVfgDeadline(windows_vfg_next_due_us);
+                }
+            } else if (windows_vfg_next_due_us && now_us >= windows_vfg_next_due_us) {
+                direct_decoder_ready_us = windows_vfg_last_real_us;
+                vfg_real_at_deadline = true;
+                windows_vfg_next_due_us = 0;
+            } else if (windows_vfg_next_due_us &&
+                       last_update_request_reason.loadAcquire() == static_cast<int>(UpdateRequestReason::Timer)) {
+                scheduleVfgDeadline(windows_vfg_next_due_us);
+            }
+            if (windows_vfg_next_due_us)
+                direct_render_frame = windows_vfg_midpoint;
+        }
+        static const QString sample_directory = qEnvironmentVariable("CHIAKI_FRAME_SAMPLE_DIR");
+        if (!sample_directory.isEmpty() && direct_decoder_ready_us > 0 &&
+            (stream_deblock_hook || sr_processed || vfg_new_midpoint) &&
+            ++windows_video_sample_count == 180) {
+            // A one-shot diagnostic uses the decoded and processed textures.
+            // It is separate from the live rendering path and timing runs.
+            const auto sample_texture = sr_processed ? windows_sr_frame.planes[0].texture : nullptr;
+            const int sample_width = sample_texture ? sample_texture->params.w : 2560;
+            const int sample_height = sample_texture ? sample_texture->params.h : 1440;
+            const auto save = [this, sample_width, sample_height](const pl_frame &frame, const QString &name) {
+                if (!WindowsVideoEnhancer::saveSample(placeboGpu(), frame, sample_directory + '/' + name,
+                                                       sample_width, sample_height))
+                    qCWarning(chiakiGui) << "Could not write enhancement sample" << name;
+            };
+            save(direct_frame, QStringLiteral("01-decoded.png"));
+            if (sr_processed)
+                save(windows_sr_frame, QStringLiteral("02-super-resolution.png"));
+            if (vfg_new_midpoint)
+                save(direct_render_frame, QStringLiteral("03-midpoint.png"));
+            if (stream_deblock_hook) {
+                auto cleanup = pl_render_fast_params;
+                cleanup.deband_params = &stream_deband;
+                cleanup.hooks = &stream_deblock_hook;
+                cleanup.num_hooks = 1;
+                if (!WindowsVideoEnhancer::saveSample(placeboGpu(), direct_frame,
+                        sample_directory + "/04-deblock.png", sample_width, sample_height, &cleanup))
+                    qCWarning(chiakiGui) << "Could not write the spatial cleanup sample";
+            }
+        }
+#endif
         frame_mix = {};
         frame_mix.num_frames = direct_frame.num_planes > 0 ? 1 : 0;
         frame_mix.frames = direct_frames;
         frame_mix.timestamps = direct_timestamps;
         queue_status = PL_QUEUE_OK;
         queue_depth_before_update = 0;
+#ifdef Q_OS_WIN
+        const auto reason = static_cast<UpdateRequestReason>(last_update_request_reason.loadAcquire());
+        // A coalesced frame notification can arrive after the renderer took
+        // that frame. Keep the current 4K image until real content or UI changes.
+        if ((windows_sr_frame.num_planes > 0 || vfg_requested) && direct_decoder_ready_us == 0 &&
+            (reason == UpdateRequestReason::PendingFrame || reason == UpdateRequestReason::FinalizePending ||
+             reason == UpdateRequestReason::Timer) &&
+            !swapchain_recreated && !quick_need_sync.loadAcquire() && !quick_need_render.loadAcquire() &&
+            !overlay_interaction_active.loadAcquire() && !startup_video_visible_refresh_pending.loadAcquire()) {
+            finalize_render();
+            return;
+        }
+#endif
     } else {
         TimedMutexLocker locker(placebo_state_mutex, "render_queue_update");
         queue_depth_before_update = pl_queue_num_frames(placebo_queue);
@@ -7108,7 +7440,7 @@ void QmlMainWindow::render()
     if (render_entry_us_local > 0 && render_to_start_frame_us >= render_entry_us_local)
         logLatencyStats("render_to_start_frame", render_to_start_frame_us - render_entry_us_local);
     // Submit immediately and let the swapchain / render path enforce pacing.
-    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s, direct_decoder_ready_us](bool present) -> bool {
+    auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s, direct_decoder_ready_us, vfg_new_midpoint, vfg_real_at_deadline, sr_processed](bool present) -> bool {
         const qint64 submit_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
         const int queue_depth_now = snapshotQueueDepth();
         if (detailedVerboseTelemetryEnabled()) {
@@ -7153,7 +7485,7 @@ void QmlMainWindow::render()
                 this->render_submit_estimate_us.storeRelease(next_render_submit_estimate_us);
             }
         }
-        const bool use_deferred_swap = present &&
+        const bool use_deferred_swap = present && !vfg_new_midpoint && !vfg_real_at_deadline &&
             render_backend == RenderBackend::Vulkan &&
             vulkan_deferred_swap_enabled &&
             deferred_swap_thread &&
@@ -7162,8 +7494,9 @@ void QmlMainWindow::render()
         // swapchain without waiting on the software frame pacer.
         static const bool immediate_direct_present =
             qEnvironmentVariableIntValue("CHIAKI_DIRECT_PRESENT_IMMEDIATE") == 1;
-        const bool skip_software_pacing = immediate_direct_present && direct_decoder_ready_us > 0 &&
-            render_backend == RenderBackend::Vulkan && !present_vsync_enabled;
+        const bool skip_software_pacing = vfg_new_midpoint || vfg_real_at_deadline ||
+            (immediate_direct_present && direct_decoder_ready_us > 0 &&
+             render_backend == RenderBackend::Vulkan && (!present_vsync_enabled || vrr_present_mode));
         if (!use_deferred_swap) {
             if (present && !skip_software_pacing) {
                 const double pace_multiplier = pending_overflow_waiting
@@ -7201,8 +7534,12 @@ void QmlMainWindow::render()
                     confirmVulkanStartup();
                     submit_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
                     if (present && direct_decoder_ready_us > 0 && submit_us >= direct_decoder_ready_us) {
-                        CHIAKI_NOISY_DEBUG().nospace()
-                            << "[latency] direct_decoder_ready_to_submit_us=" << (submit_us - direct_decoder_ready_us);
+                        CHIAKI_NOISY_DEBUG().nospace() << "[latency] "
+                            << (vfg_new_midpoint ? "vfg_midpoint_ready_to_submit_us=" :
+                                vfg_real_at_deadline ? "vfg_real_ready_to_submit_us=" :
+                                sr_processed ? "sr_ready_to_submit_us=" :
+                                                       "direct_decoder_ready_to_submit_us=")
+                            << (submit_us - direct_decoder_ready_us);
                     }
             logLatencyStats("pl_swapchain_submit_frame", submit_us - submit_begin_us);
             CHIAKI_NOISY_DEBUG().nospace()
@@ -7337,6 +7674,10 @@ void QmlMainWindow::render()
     }
     if (!hint_frame && frame_mix.num_frames)
         hint_frame = frame_mix.frames[0];
+    // Keep the negotiated signal (especially the PQ swapchain) when an
+    // enhancement pass uses a linear working texture.
+    if (bypass_frame_queue && direct_frame.num_planes > 0)
+        hint_frame = &direct_frame;
     struct pl_color_space hint = hint_frame ? hint_frame->color : pl_color_space{};
     // libplacebo API 361 and later read a hint with unknown primaries and transfer as a request for
     // VK_COLOR_SPACE_PASS_THROUGH_EXT, and switching MoltenVK's swapchain to it waits forever for the
@@ -7431,27 +7772,80 @@ void QmlMainWindow::render()
     target_frame.overlays = &overlay;
     target_frame.num_overlays = 1;
 #ifdef Q_OS_WIN
-    // Set the destination luminance independently of the source HDR metadata.
-    // The swapchain still owns its transfer function and signal format.
-    if (apply_display_target && render_backend == RenderBackend::Vulkan && hint_frame &&
-        !target_prim && !target_trc && !target_peak && !target_contrast &&
-        pl_color_space_is_hdr(&hint_frame->color) && pl_color_space_is_hdr(&target_frame.color)) {
-        const auto display = windows_hdr_display.load(std::memory_order_relaxed);
-        if (display.peak_nits > 0.0f) {
-            target_frame.color.hdr.max_luma = display.peak_nits;
-            target_frame.color.hdr.min_luma = display.black_nits;
-            if (display.peak_nits != applied_windows_hdr_display.peak_nits ||
-                display.black_nits != applied_windows_hdr_display.black_nits) {
-                qCInfo(chiakiGui) << "HDR rendering uses Windows display range (nits):"
-                                 << display.black_nits << display.peak_nits
-                                 << "source transfer:" << hint_frame->color.transfer
-                                 << "swapchain transfer:" << target_frame.color.transfer;
-            }
-        }
-        applied_windows_hdr_display = display;
-    } else {
-        applied_windows_hdr_display = {};
+    if (!logged_decoded_hdr && direct_decoder_ready_us > 0 && hint_frame &&
+        pl_color_space_is_hdr(&hint_frame->color)) {
+        logged_decoded_hdr = true;
+        qCInfo(chiakiGui) << "Decoded HDR frame transfer=" << hint_frame->color.transfer
+                         << "swapchain transfer=" << target_frame.color.transfer;
     }
+    const bool native_hdr = apply_display_target && render_backend == RenderBackend::Vulkan && hint_frame &&
+        !target_prim && !target_trc && !target_peak && !target_contrast &&
+        hint_frame->color.transfer == PL_COLOR_TRC_PQ &&
+        target_frame.color.transfer == PL_COLOR_TRC_PQ &&
+        target_frame.color.primaries == PL_COLOR_PRIM_BT_2020;
+    struct pl_color_map_params hdr_color_map;
+    struct pl_color_adjustment hdr_color_adjustment;
+    if (native_hdr) {
+        WindowsDisplayHdr display;
+        HdrCalibration calibration;
+        {
+            QMutexLocker lock(&windows_hdr_lock);
+            display = windows_hdr_display;
+            calibration = hdr_calibration;
+        }
+
+        // libplacebo maps to the display gamut and encodes the result in the swapchain gamut.
+        auto &target_hdr = target_frame.color.hdr;
+        const auto *container = pl_raw_primaries_get(target_frame.color.primaries);
+        const bool display_gamut = calibration.display_gamut &&
+            pl_primaries_compatible(&display.primaries, container);
+        target_hdr.prim = display_gamut ? pl_primaries_clip(&display.primaries, container) : *container;
+        if (calibration.peak > 0)
+            target_hdr.max_luma = calibration.peak;
+        else if (display.peak_nits > 0.0f)
+            target_hdr.max_luma = display.peak_nits;
+        if (calibration.black >= 0)
+            target_hdr.min_luma = qMax(1e-7f, calibration.black / 1000.0f);
+        else if (display.peak_nits > 0.0f)
+            target_hdr.min_luma = qMax(1e-7f, display.black_nits);
+        if (target_hdr.max_luma > 0.0f)
+            target_hdr.min_luma = qMin(target_hdr.min_luma, target_hdr.max_luma / 10.0f);
+
+        hdr_color_map = params.color_map_params ? *params.color_map_params : pl_color_map_default_params;
+        hdr_color_map.gamut_mapping = &pl_gamut_map_perceptual;
+        hdr_color_map.gamut_expansion = false;
+        if (calibration.curve == 1) {
+            hdr_color_map.tone_mapping_function = &pl_tone_map_bt2390;
+            hdr_color_map.tone_constants.knee_offset = 0.5f;
+        } else {
+            hdr_color_map.tone_mapping_function = &pl_tone_map_spline;
+            hdr_color_map.tone_constants.spline_contrast =
+                pl_color_map_default_params.tone_constants.spline_contrast * calibration.midtones / 100.0f;
+        }
+        params.color_map_params = &hdr_color_map;
+        if (calibration.saturation != 100) {
+            hdr_color_adjustment = params.color_adjustment ? *params.color_adjustment : pl_color_adjustment_neutral;
+            hdr_color_adjustment.saturation *= calibration.saturation / 100.0f;
+            params.color_adjustment = &hdr_color_adjustment;
+        }
+        if (!hdrActive() || !(calibration == applied_hdr_calibration) ||
+            display.peak_nits != applied_windows_hdr_display.peak_nits ||
+            display.black_nits != applied_windows_hdr_display.black_nits ||
+            !pl_raw_primaries_equal(&display.primaries, &applied_windows_hdr_display.primaries))
+            qCInfo(chiakiGui) << "HDR10 calibration (PQ/BT.2020):" << hdr_color_map.tone_mapping_function->name
+                             << "range nits" << target_hdr.min_luma << target_hdr.max_luma
+                             << "midtones %" << calibration.midtones << "saturation %" << calibration.saturation
+                             << "display gamut" << display_gamut
+                             << "RGBW xy"
+                             << target_hdr.prim.red.x << target_hdr.prim.red.y
+                             << target_hdr.prim.green.x << target_hdr.prim.green.y
+                             << target_hdr.prim.blue.x << target_hdr.prim.blue.y
+                             << target_hdr.prim.white.x << target_hdr.prim.white.y;
+        applied_windows_hdr_display = display;
+        applied_hdr_calibration = calibration;
+    }
+    if (hdr_active.fetchAndStoreRelaxed(native_hdr ? 1 : 0) != static_cast<int>(native_hdr))
+        emit hdrStatusChanged();
 #endif
     if(target_prim)
     {
@@ -7613,10 +8007,21 @@ void QmlMainWindow::render()
                                                fsr_hook, fsrcnnx_hook_8, fsrcnnx_hook_16);
         }
     }
-    const struct pl_hook *active_hooks[] = {fsrcnnx_hook};
+    QVarLengthArray<const struct pl_hook *, 4> active_hooks;
+    if (stream_deblock_hook && apply_display_target) {
+        active_hooks.append(stream_deblock_hook);
+        params.deband_params = &stream_deband;
+    }
+    if (fsrcnnx_hook)
+        active_hooks.append(fsrcnnx_hook);
+    else if (!active_hooks.isEmpty())
+        for (int i = 0; i < params.num_hooks; ++i)
+            active_hooks.append(params.hooks[i]);
+    if (!active_hooks.isEmpty()) {
+        params.hooks = active_hooks.constData();
+        params.num_hooks = active_hooks.size();
+    }
     if (fsrcnnx_hook) {
-        params.hooks = active_hooks;
-        params.num_hooks = 1;
         switch (video_preset) {
         case VideoPreset::HighQualitySpatial:
             if (fsrcnnx_hook == fsr_hook)
@@ -7755,6 +8160,12 @@ bool QmlMainWindow::handleShortcut(QKeyEvent *event)
     case Qt::Key_O:
         emit menuRequested();
         return true;
+#ifdef Q_OS_WIN
+    case Qt::Key_H:
+        if (session && render_backend == RenderBackend::Vulkan && !event->isAutoRepeat())
+            emit hdrPanelRequested();
+        return session && render_backend == RenderBackend::Vulkan;
+#endif
     case Qt::Key_Q:
 #ifndef Q_OS_MACOS
         close();

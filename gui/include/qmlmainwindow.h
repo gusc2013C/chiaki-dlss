@@ -34,6 +34,8 @@ extern "C" {
 #elif defined(Q_OS_WIN)
 #include <vulkan/vulkan_win32.h>
 #include "windowsDisplayHdr.h"
+#include "windowsVideoEnhancer.h"
+#include "windowsVrr.h"
 #endif
 
 Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
@@ -53,6 +55,9 @@ class StatsOverlayWidget;
 class BufferedPlaybackPacerThread;
 class DeferredPresentPacerThread;
 class DeferredSwapThread;
+#ifdef Q_OS_WIN
+class VfgPresentationTimer;
+#endif
 
 class QmlMainWindow : public QWindow
 {
@@ -68,6 +73,9 @@ class QmlMainWindow : public QWindow
     Q_PROPERTY(int runtimeRendererBackend READ runtimeRendererBackend CONSTANT)
     Q_PROPERTY(double queueDepthAverage READ queueDepthAverage NOTIFY queueDepthAverageChanged)
     Q_PROPERTY(double pendingFrameAge READ pendingFrameAge NOTIFY pendingFrameAgeChanged)
+    Q_PROPERTY(bool hdrActive READ hdrActive NOTIFY hdrStatusChanged)
+    Q_PROPERTY(int hdrDisplayPeak READ hdrDisplayPeak NOTIFY hdrStatusChanged)
+    Q_PROPERTY(bool hdrDisplayGamutAvailable READ hdrDisplayGamutAvailable NOTIFY hdrStatusChanged)
 
 public:
     enum class UpdateRequestReason {
@@ -150,6 +158,9 @@ public:
     Q_INVOKABLE void grabInput();
     Q_INVOKABLE void releaseInput();
     Q_INVOKABLE void requestOverlayUpdate();
+    bool hdrActive() const;
+    int hdrDisplayPeak() const;
+    bool hdrDisplayGamutAvailable() const;
     Q_INVOKABLE void setOverlayInteractionActive(bool active);
     Q_INVOKABLE void setStatsOverlayActive(bool active);
     Q_INVOKABLE void noteLoadingTransitionComplete();
@@ -179,6 +190,8 @@ signals:
     void zoomFactorChanged();
     void videoPresetChanged();
     void menuRequested();
+    void hdrPanelRequested();
+    void hdrStatusChanged();
     void directStreamChanged();
     void queueDepthAverageChanged();
     void pendingFrameAgeChanged();
@@ -189,6 +202,9 @@ private:
     friend class BufferedPlaybackPacerThread;
     friend class DeferredPresentPacerThread;
     friend class DeferredSwapThread;
+#ifdef Q_OS_WIN
+    friend class VfgPresentationTimer;
+#endif
 
     struct PendingFrameEntry;
 
@@ -308,6 +324,7 @@ private:
     bool direct_stream = false;
     bool direct_start_fullscreen = false;
     bool direct_start_borderless = false;
+    bool direct_cover_display = false;
     std::atomic<qint64> queue_pts_origin_cached_us = -1;
     uint64_t next_frame_target_us = 0;
     double last_throttle_interval_s = 0.0;
@@ -416,6 +433,7 @@ private:
     bool startup_warmup_frame_active = false;
     bool vulkan_deferred_swap_enabled = false;
     bool present_vsync_enabled = true;
+    bool vrr_present_mode = false;
 
     QVulkanInstance *qt_vk_inst = {};
     QOpenGLContext *qt_gl_context = {};
@@ -468,13 +486,42 @@ private:
     pl_options renderparams_opts = {};
     bool renderparams_changed = false;
     const struct pl_hook *fsr_hook = nullptr;
+    const struct pl_hook *stream_deblock_hook = nullptr;
     const struct pl_hook *fsrcnnx_hook_8 = nullptr;
     const struct pl_hook *fsrcnnx_hook_16 = nullptr;
 #ifdef Q_OS_WIN
-    std::atomic<WindowsDisplayHdr> windows_hdr_display{};
+    struct HdrCalibration {
+        int peak = 0;
+        int black = -1;
+        int midtones = 100;
+        int saturation = 100;
+        int curve = 0;
+        bool display_gamut = true;
+        bool operator==(const HdrCalibration &other) const
+        {
+            return peak == other.peak && black == other.black && midtones == other.midtones &&
+                   saturation == other.saturation && curve == other.curve && display_gamut == other.display_gamut;
+        }
+    };
+    mutable QMutex windows_hdr_lock;
+    WindowsDisplayHdr windows_hdr_display{};
     WindowsDisplayHdr applied_windows_hdr_display{};
+    HdrCalibration hdr_calibration{}, applied_hdr_calibration{};
+    bool logged_decoded_hdr = false;
     void refreshWindowsDisplayHdr();
+    void refreshHdrCalibration();
+    std::unique_ptr<WindowsVideoEnhancer> windows_sr, windows_vfg;
+    pl_frame windows_sr_frame{};
+    int windows_video_sample_count = 0;
+    qint64 windows_sr_last_real_us = 0;
+    pl_frame windows_vfg_midpoint{};
+    qint64 windows_vfg_next_due_us = 0;
+    qint64 windows_vfg_last_real_us = 0;
+    QAtomicInteger<quint64> windows_vfg_timer_generation = 0;
+    std::unique_ptr<VfgPresentationTimer> windows_vfg_timer;
+    void scheduleVfgDeadline(qint64 due_us);
 #endif
+    QAtomicInteger<int> hdr_active = 0;
 
     struct {
         PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;

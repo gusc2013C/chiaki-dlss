@@ -346,6 +346,18 @@ class Settings : public QObject
 		void SetDisplayTargetContrast(int contrast);
 
 		int GetDisplayTargetPeak() const;
+		int GetHdrPeak() const;
+		void SetHdrPeak(int value);
+		int GetHdrBlack() const;
+		void SetHdrBlack(int value);
+		int GetHdrMidtones() const;
+		void SetHdrMidtones(int value);
+		int GetHdrSaturation() const;
+		void SetHdrSaturation(int value);
+		int GetHdrCurve() const;
+		void SetHdrCurve(int value);
+		bool GetHdrDisplayGamut() const;
+		void SetHdrDisplayGamut(bool enabled);
 		void SetDisplayTargetPeak(int peak);
 
 		int GetDisplayTargetTrc() const;

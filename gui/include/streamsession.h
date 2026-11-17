@@ -93,6 +93,7 @@ class SdeckHapticsWorker;
 		bool zoom;
 		bool stretch;
 		bool borderless_window = false;
+		bool borderless_fullscreen = false;
 		bool enable_keyboard;
 		bool keyboard_controller_enabled;
 		bool mouse_touch_enabled;

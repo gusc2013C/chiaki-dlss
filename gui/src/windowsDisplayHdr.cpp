@@ -41,7 +41,12 @@ WindowsDisplayHdr queryWindowsDisplayHdr(HWND window)
             const float black = std::isfinite(display.MinLuminance) &&
                                 display.MinLuminance >= 0.0f && display.MinLuminance < display.MaxLuminance
                 ? display.MinLuminance : 0.0f;
-            return {display.MaxLuminance, black};
+            const pl_raw_primaries primaries{
+                {display.RedPrimary[0], display.RedPrimary[1]},
+                {display.GreenPrimary[0], display.GreenPrimary[1]},
+                {display.BluePrimary[0], display.BluePrimary[1]},
+                {display.WhitePoint[0], display.WhitePoint[1]}};
+            return {display.MaxLuminance, black, pl_primaries_valid(&primaries) ? primaries : pl_raw_primaries{}};
         }
     }
     return {};
