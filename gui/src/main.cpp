@@ -40,6 +40,14 @@ int main(int argc, char *argv[]) { return real_main(argc, argv); }
 #include <QCommandLineParser>
 #include <QMap>
 #include <QSurfaceFormat>
+#ifdef Q_OS_WIN
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMessageBox>
+#endif
 
 Q_DECLARE_METATYPE(ChiakiLogLevel)
 Q_DECLARE_METATYPE(ChiakiRegistEventType)
@@ -63,6 +71,88 @@ static const QMap<QString, CLICommand> cli_commands = {
 
 int RunStream(QGuiApplication &app, const StreamSessionConnectInfo &connect_info);
 int RunMain(QGuiApplication &app, Settings *settings, bool exit_app_on_stream_exit);
+
+#ifdef Q_OS_WIN
+static bool configurePortablePreset(const QString &requested)
+{
+	const QDir package(QCoreApplication::applicationDirPath());
+	QFile preset_file(package.filePath("chiaki-ps5-preset.json"));
+	if (!preset_file.exists() && requested.isEmpty())
+		return true;
+	auto error = [](const QString &message) {
+		QMessageBox::critical(nullptr, QStringLiteral("chiaki-dlss"), message);
+		return false;
+	};
+	if (!preset_file.open(QIODevice::ReadOnly))
+		return error(QStringLiteral("Could not open the portable video preset."));
+	const auto document = QJsonDocument::fromJson(preset_file.readAll()).object();
+	const auto defaults = document.value("settings").toObject();
+	const auto profiles = document.value("profiles").toObject();
+	if (document.value("schema").toInt() != 1 || defaults.isEmpty() || profiles.isEmpty())
+		return error(QStringLiteral("The portable video preset is invalid."));
+	if (!requested.isEmpty() && !profiles.contains(requested))
+		return error(QStringLiteral("Unknown video preset: %1").arg(requested));
+	if (!package.mkpath("data"))
+		return error(QStringLiteral("Extract chiaki-dlss to a writable folder."));
+
+	QCoreApplication::setApplicationName(QStringLiteral("Chiaki-dlss"));
+	QApplication::setApplicationDisplayName(QStringLiteral("chiaki-dlss"));
+	QSettings::setDefaultFormat(QSettings::IniFormat);
+	QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, package.filePath("data"));
+	QSettings settings;
+	settings.setFallbacksEnabled(false);
+
+	const auto initial = document.value("defaultProfile").toString();
+	const bool first_run = !settings.contains("portable/preset");
+	const auto selected = requested.isEmpty() ? settings.value("portable/preset", initial).toString() : requested;
+	const auto profile = profiles.value(selected).toObject();
+	const int fps = profile.value("sourceFps").toInt();
+	const int quality = profile.value("rtxVideoQuality").toInt(-1);
+	const auto codec = profile.value("codec").toString();
+	const auto vfg = profile.value("frameGeneration").toString();
+	if ((fps != 30 && fps != 60) || (quality != 0 && quality != 4) ||
+	    (codec != "h265" && codec != "h265_hdr") || (vfg != "off" && vfg != "low"))
+		return error(QStringLiteral("The selected portable video preset is invalid."));
+	if (first_run) {
+		for (auto it = defaults.begin(); it != defaults.end(); ++it) {
+			if (it.key().contains('/') || it.key().contains('\\'))
+				return error(QStringLiteral("The portable preset contains an invalid settings key."));
+			settings.setValue(QStringLiteral("settings/") + it.key(), it.value().toVariant());
+		}
+	}
+
+	const bool provider = QFileInfo(package.filePath("chiaki-veyra-vfg.dll")).isFile();
+	const bool sr_ready = provider && QFileInfo(package.filePath("runtime/experimental/nvngx_vsr.dll")).isFile() &&
+		QFileInfo(package.filePath("runtime/config/ngx-local.json")).isFile();
+	const bool vfg_ready = provider && QFileInfo(package.filePath("runtime/nvidia-vfg/NVVideoEffects.dll")).isFile() &&
+		QFileInfo(package.filePath("runtime/nvidia-vfg/NVCVImage.dll")).isFile() &&
+		QFileInfo(package.filePath("runtime/nvidia-vfg/nvVFXVideoFrameGeneration.dll")).isFile() &&
+		QFileInfo(package.filePath("shaders/VfgShotChange.dxil")).isFile();
+	const bool native_fallback = vfg != "off" && !vfg_ready;
+	if (first_run || !requested.isEmpty() || native_fallback != settings.value("portable/native_fallback").toBool()) {
+		settings.setValue("settings/codec_local_ps5", codec);
+		settings.setValue("settings/fps_local_ps5", QString::number(native_fallback ? 60 : fps));
+	}
+	settings.setValue("portable/preset", selected);
+	settings.setValue("portable/native_fallback", native_fallback);
+	settings.sync();
+	if (settings.status() != QSettings::NoError)
+		return error(QStringLiteral("Could not save the portable video settings."));
+
+	qputenv("CHIAKI_DIRECT_PRESENT_IMMEDIATE", "1");
+	qputenv("CHIAKI_VRR", "1");
+	qputenv("CHIAKI_DLSS_SR", "0");
+	qputenv("CHIAKI_STREAM_CLEANUP", "0");
+	qputenv("CHIAKI_RTX_VIDEO_SR", QByteArray::number(sr_ready ? quality : 0));
+	qputenv("CHIAKI_RTX_VIDEO_SCALE", "2");
+	qputenv("CHIAKI_VFG", vfg_ready ? vfg.toLatin1() : QByteArray("off"));
+	qputenv("CHIAKI_DLSS_RUNTIME", QFile::encodeName(package.filePath("runtime/experimental")));
+	qputenv("CHIAKI_VFG_RUNTIME", QFile::encodeName(package.filePath("runtime/nvidia-vfg")));
+	if ((quality && !sr_ready) || native_fallback)
+		qWarning("Portable NVIDIA runtime missing. Run Install-NVIDIA-Runtime.cmd to enable the selected enhancements.");
+	return true;
+}
+#endif
 
 int real_main(int argc, char *argv[])
 {
@@ -101,11 +191,6 @@ int real_main(int argc, char *argv[])
 
 	qputenv("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu");
 #if defined(Q_OS_WIN)
-	const size_t cSize = strlen(argv[0])+1;
-	wchar_t wc[cSize];
-	mbstowcs (wc, argv[0], cSize);
-	QString import_path = QFileInfo(QString::fromWCharArray(wc)).dir().absolutePath() + "/qml";
-	qputenv("QML_IMPORT_PATH", import_path.toUtf8());
 	// Microsoft's OpenCL, OpenGL and Vulkan Compatibility Pack adds the Dozen driver (Vulkan on
 	// D3D12) beside the GPU's own, and loading it can crash the app even when it isn't used. Where
 	// Dozen is the only Vulkan driver, Vulkan then finds no device and chiaki-ng uses OpenGL,
@@ -142,6 +227,9 @@ int real_main(int argc, char *argv[])
 	QtWebEngineQuick::initialize();
 #endif
 	QApplication app(argc, argv);
+#ifdef Q_OS_WIN
+	qputenv("QML_IMPORT_PATH", QFile::encodeName(QDir(app.applicationDirPath()).filePath("qml")));
+#endif
 
 #ifdef Q_OS_MACOS
 	QGuiApplication::setWindowIcon(QIcon(":/icons/chiaking_macos.svg"));
@@ -185,6 +273,10 @@ int real_main(int argc, char *argv[])
 	parser.addOption(borderless_fullscreen_option);
 	QCommandLineOption source_fps_option("source-fps", "Request 30 or 60 fps from the console for this stream.", "fps");
 	parser.addOption(source_fps_option);
+#ifdef Q_OS_WIN
+	QCommandLineOption video_preset_option("video-preset", "Select a video preset from the Windows portable package.", "name");
+	parser.addOption(video_preset_option);
+#endif
 
 	QCommandLineOption dualsense_option("dualsense", "Enable DualSense haptics and adaptive triggers (PS5 and DualSense connected via USB only).");
 	parser.addOption(dualsense_option);
@@ -203,6 +295,10 @@ int real_main(int argc, char *argv[])
 
 	parser.process(app);
 	QStringList args = parser.positionalArguments();
+#ifdef Q_OS_WIN
+	if (!configurePortablePreset(parser.value(video_preset_option)))
+		return 1;
+#endif
 
 	Settings settings(parser.isSet(profile_option) ? parser.value(profile_option) : QString());
 	bool exit_app_on_stream_exit = parser.isSet(stream_exit_option);

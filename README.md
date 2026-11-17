@@ -18,9 +18,9 @@ Only download chiaki-ng from these sources:
 
 Other websites offering chiaki-ng downloads, such as chiaki-ng.com, are not run by this project, and we can't vouch for the files they serve.
 
-## chiaki-dlss Windows PS5 preset
+## chiaki-dlss Windows x64
 
-Apply the tested 50 Mbps LAN settings for Windows Vulkan, RTX Video 4K, 30→60 VFG, and HDR calibration. [Download the preset ZIP](https://github.com/gusc2013C/chiaki-dlss/releases/download/windows-ps5-preset-v1/chiaki-dlss-windows-ps5-preset.zip) or read the [application instructions](presets/windows-ps5/README.md).
+The portable build includes the executable, the tested 50 Mbps PS5 preset, the video provider, and NVIDIA runtime setup. [Download the Windows x64 ZIP](https://github.com/gusc2013C/chiaki-dlss/releases/download/windows-x64-portable-v1/chiaki-dlss-windows-x64-portable.zip) or read the [setup instructions](scripts/windows-portable/README.md).
 
 ## Disclaimer
 This project is not endorsed or certified by Sony Interactive Entertainment LLC.
